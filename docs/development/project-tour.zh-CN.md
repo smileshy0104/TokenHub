@@ -868,7 +868,87 @@ tokenhub db contract --dry-run
 
 前端只将管理会话保存在 `sessionStorage`，并清理旧的持久化 `localStorage` 会话。
 
-### 11.2 后端 RBAC
+### 11.2 身份源与企业登录
+
+系统设置中的“身份源（Identity Provider）”用于将 TokenHub 控制台接入企业统一身份认证，使用户通过企业 SSO、OAuth 或 OIDC 登录，而不需要在 TokenHub 中单独维护一套密码。它只影响控制台用户认证，不用于业务应用访问 `/v1/*`；业务调用仍使用 Project API Key。
+
+当前内置模板包括：
+
+- 通用 OIDC
+- 通用 OAuth2
+- Google
+- Microsoft Entra ID
+- Okta
+- Keycloak
+- GitLab
+- 钉钉
+- 飞书
+- 企业微信
+
+插件还可以通过 `identity_provider_template` 能力向管理页面增加身份源模板。模板会预填协议、Issuer、授权端点、Token 端点、UserInfo 端点、Scope、Claim 和登录按钮信息，但实际的 Client ID、Client Secret 与回调地址仍需在对应身份平台中注册。
+
+一次典型登录流程如下：
+
+1. 用户在登录页选择对应的企业登录入口。
+2. TokenHub 生成带 PKCE、State 和 Nonce 的授权请求，并将浏览器重定向到身份平台。
+3. 身份平台完成认证后，将授权码返回 TokenHub Callback。
+4. TokenHub 使用授权码换取访问令牌，并从 UserInfo 端点读取用户信息。
+5. TokenHub 根据邮箱查找已有控制台用户；找不到时创建新用户。
+6. TokenHub 创建管理 Session，浏览器随后使用该 Session 访问 `/api/admin/*`。
+
+身份源中的 Claim 配置决定如何解释身份平台返回的数据：
+
+| 配置 | 作用 | 常见值 |
+| --- | --- | --- |
+| 用户名 Claim | 生成或更新 TokenHub 用户名 | `preferred_username`、`username` |
+| 邮箱 Claim | 查找和关联已有用户 | `email`、`enterprise_email` |
+| 团队 Claim | 将用户映射到已有团队 | `department`、`groups` |
+| 用户唯一标识 Claim | 没有邮箱时生成稳定内部标识 | `sub`、`union_id`、`userid` |
+
+Claim 支持点号路径，例如 `user.profile.email`。如果身份平台明确返回 `email_verified: false`，TokenHub 会拒绝登录。若没有邮箱，系统可以根据 Subject Claim 生成稳定的内部邮箱；生产环境仍应优先使用可信、已验证的企业邮箱。
+
+首次登录时可配置以下默认授权：
+
+- 默认角色：`user` 或 `team_leader`；只在创建用户时使用，不覆盖已有用户角色，也不会自动授予系统管理员权限。
+- 默认团队：团队 Claim 无法匹配时使用。团队 Claim 可以匹配团队 ID、名称或代码。
+- 默认项目：自动将用户加入指定项目。
+- 默认项目角色：`viewer`、`developer` 或 `maintainer`；未配置时默认为 `developer`。
+
+对于已存在的同邮箱用户，登录过程会保留其现有角色，可更新姓名、未冲突的用户名和可匹配的团队，并补充尚未存在的默认项目成员关系；被禁用的用户不能通过身份源重新登录。
+
+保存身份源不等于登录已经生效，应区分以下状态：
+
+1. **已创建**：数据库中存在身份源记录。
+2. **已配置**：Client ID、Client Secret、端点和 Claim 已填写。
+3. **已启用**：资源状态为启用，登录页可以将其作为入口。
+4. **实际可用**：TokenHub 能访问身份平台，回调地址完全匹配，端点、Scope 和 Claim 都正确。
+
+本地部署的后端地址当前为 `http://localhost:8081`，对应 Callback 通常是：
+
+```text
+http://localhost:8081/api/admin/auth/oauth/callback
+```
+
+生产环境应登记实际的 HTTPS 外部地址，例如：
+
+```text
+https://tokenhub.example.com/api/admin/auth/oauth/callback
+```
+
+Callback 的协议、域名、端口、路径和尾部斜杠必须与身份平台登记值完全一致。反向代理还必须正确传递 Host 和 Proto，并将代理网段加入可信代理配置，否则 TokenHub 可能生成错误的回调地址。
+
+虽然配置界面的协议选项还包含 `saml` 和 `ldap`，当前实际网页登录运行时主要实现的是 `oidc` 和 `oauth2`。不能仅凭界面可选就认为 SAML/LDAP 已具备完整登录能力，生产配置应优先使用 OIDC 或 OAuth 2.0。
+
+企业生产环境建议至少配置一个可靠身份源，同时保留一个受到严格控制的本地应急管理员账号。在切换登录策略前，应使用无痕窗口完成端到端测试，避免身份平台故障、Client Secret 过期或 Callback 配置错误时彻底失去后台访问能力。
+
+相关实现入口：
+
+- `frontend/features/admin/resources/settings-config.tsx`：身份源管理表单和默认授权配置。
+- `frontend/features/admin/shared/auth.tsx`：内置身份源模板和登录入口。
+- `backend/internal/server/identity_provider_oauth.go`：身份源加载、端点解析和协议辅助逻辑。
+- `backend/internal/server/admin_auth_http.go`：OAuth 授权、回调、UserInfo、用户创建和 Session 创建。
+
+### 11.3 后端 RBAC
 
 角色主要映射为：
 
@@ -886,14 +966,14 @@ tokenhub db contract --dry-run
 
 需要特别注意：Admin RBAC 很多地方依赖 Handler 显式调用 `requireAdmin` 和对象级检查。新增 Handler 必须配套授权测试，不能只依赖前端隐藏菜单。
 
-### 11.3 密钥和敏感数据
+### 11.4 密钥和敏感数据
 
 - Project API Key 不保存明文，只保存 SHA-256 摘要。
 - Provider 凭证、原始账单快照、后台 Responses 载荷等使用从 `TOKENHUB_SECRET_KEY` 派生的 AES-GCM 密钥加密。
 - 所有共享数据库的实例必须使用同一个稳定 Secret Key。
 - 不要将真实 `.env`、数据库、备份、Provider Key 或 Token 提交到 Git。
 
-### 11.4 代理和 CORS
+### 11.5 代理和 CORS
 
 - `TOKENHUB_TRUSTED_PROXY_CIDRS` 决定哪些代理的 Forwarded Header 可被信任。
 - `TOKENHUB_CORS_ALLOWED_ORIGINS` 必须精确列出浏览器 Origin。
