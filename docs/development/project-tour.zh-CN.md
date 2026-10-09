@@ -948,7 +948,112 @@ Callback 的协议、域名、端口、路径和尾部斜杠必须与身份平�
 - `backend/internal/server/identity_provider_oauth.go`：身份源加载、端点解析和协议辅助逻辑。
 - `backend/internal/server/admin_auth_http.go`：OAuth 授权、回调、UserInfo、用户创建和 Session 创建。
 
-### 11.3 后端 RBAC
+### 11.3 安全策略：访问安全与内容安全
+
+控制台的“安全策略”页面分为“访问安全”和“内容安全”两个标签。二者名称相近，但数据模型、运行机制和当前成熟度不同，排查问题时不能混为一谈。
+
+#### 11.3.1 访问安全
+
+“访问安全”使用通用管理资源 `security-policies`，当前表单包含：
+
+| 字段 | 设计含义 |
+| --- | --- |
+| `mask_prompts` | 要求请求和响应审计避免直接展示完整 Prompt |
+| `ip_allowlist` | 允许访问的 IP 或 CIDR，每行一个；留空表示不配置 |
+| `error_passthrough` | 上游错误处理方式：`sanitized`、`passthrough` 或 `hidden` |
+
+需要特别注意：当前这些字段主要作为通用管理资源被创建、查询、修改、删除和展示，后端网关、审计和错误处理链尚未读取它们执行统一的运行时策略。因此，“访问安全”记录处于**已保存配置**状态，并不等于 Prompt 已自动脱敏、全局 IP 白名单已拦截请求或错误透传方式已生效。
+
+当前真正参与请求准入的 IP 白名单是 API Key 自身的 `ip_allowlist`。它在鉴权时根据客户端 IP 检查，和“访问安全”资源中的同名字段不是同一执行路径。部署在反向代理后时，还必须正确配置可信代理 CIDR，否则客户端 IP 判断可能使用代理地址或拒绝不可信的 Forwarded Header。
+
+在运行时接入 `security-policies` 前，不应把这三个字段当作已经落地的安全边界。生产环境仍需分别依赖：
+
+- API Key IP 白名单控制业务调用来源。
+- RBAC 和管理 Session 控制后台访问。
+- 反向代理、网络防火墙和 CORS 控制外部入口。
+- 现有审计载荷权限、加密和导出规则保护 Prompt 与响应。
+- 网关现有错误归一化逻辑控制暴露给调用方的错误信息。
+
+#### 11.3.2 内容安全
+
+“内容安全”使用独立的 Guardrail 数据模型和 API，已经接入网关请求执行链。策略可以绑定全部项目或指定项目；API Key 自动继承所属项目的策略。保存启用策略后立即生效，不需要额外发布或审批；停用或删除后也会立即停止参与新请求判定。
+
+当前检查点固定为：
+
+```text
+请求完成鉴权和项目解析
+        ↓
+提取可检查的用户可见文本
+        ↓
+执行适用于该项目的内容安全策略
+        ↓
+审计、脱敏、阻断或继续路由
+        ↓
+发送给 Provider
+```
+
+当前只实现 `before_provider`，也就是请求发送给 Provider 之前的检查；暂未执行 Provider 响应内容检查。网关会从 Chat Completions、Responses、Responses Compact、Anthropic Messages、Embeddings、Rerank、Gemini、SystemOne、媒体与图片等已接入路径中提取可识别的文本目标。结构化工具参数、任意 JSON 深层字段、二进制内容以及需要代码语义分析的内容不应假定已被完整覆盖。
+
+每条策略至少包含一个检测项，当前最多 32 个。支持三种检测器：
+
+| 检测器 | 配置 | 可用动作 |
+| --- | --- | --- |
+| 自定义文本规则 `pattern` | 关键词和 RE2 兼容正则表达式；任意一项匹配即命中 | `audit`、`block` |
+| 敏感数据 `sensitive_data` | 凭证、邮箱、手机号、中国大陆身份证、银行卡、姓名、地址、出生日期 | `audit`、`mask`、`block` |
+| 模型分类 `model` | 独立的 Qwen3Guard 兼容检测服务 | `audit`、`block` |
+
+动作含义：
+
+- `audit`：允许请求继续，但在 Guardrail 判定和审计摘要中记录命中。
+- `mask`：仅敏感数据检测器支持，将命中的请求文本替换为 `[REDACTED]` 后再继续执行。
+- `block`：拒绝请求，不调用上游 Provider。
+
+多条策略和多个检测项会累积评估，最终采用最严格的动作：
+
+```text
+block > mask > audit > allow
+```
+
+确定性检测器在 TokenHub 进程内运行。对于模型检测器，TokenHub 会调用 `TOKENHUB_GUARDRAIL_MODEL_URL` 指定的独立服务；发送前会在仅供检测的文本副本中应用本地 `mask` 命中的脱敏结果，降低已经识别出的敏感值被传到检测模型的风险。没有被本地规则识别的文本仍可能发送给远端检测服务，因此该服务必须部署在获准的数据边界内，并单独评估其传输、日志和保留策略。
+
+模型检测器可以配置：
+
+- 阻断范围：仅“不安全”，或“有争议或不安全”。
+- 模型不可用时：`allow_and_audit`（放行并记录检测降级）或 `block`（失败关闭）。
+
+当前部署的 `TOKENHUB_GUARDRAIL_MODEL_URL` 为空，因此不会发起 Qwen3Guard 模型调用。此时模型检测项会按照自己的“模型不可用时”配置处理；本地关键词、正则和敏感数据检测不受影响。
+
+编辑器中的“测试”功能使用尚未保存的当前配置检查输入文本，可以查看：
+
+- 最终动作。
+- 命中位置。
+- 脱敏结果。
+- 命中的策略检测项、分类和原因码。
+- 是否发生短路或检测降级。
+- 检测耗时。
+
+测试内容不会作为正式网关请求执行，也不会保存为策略。广泛启用前应同时准备有代表性的正例和反例，避免关键词、姓名、地址和宽泛正则导致误报。
+
+策略阻断请求时，兼容 API 返回 HTTP 403 和 `guardrail_blocked`。响应详情包含分类、原因码、策略命中信息和用于关联审计记录的 Request ID，但不会返回命中的原始敏感文本。确定性检测还受累计工作预算和命中数量预算保护；病态规则组合或极端密集命中超过预算时返回 HTTP 503 `guardrail_evaluation_budget_exceeded`，避免安全检查长期占用 CPU 或内存。
+
+应继续区分内容安全策略的几个状态：
+
+1. **已创建**：策略和检测项已经保存。
+2. **已启用**：策略状态为 `active`。
+3. **已绑定**：策略绑定全部项目或包含目标项目。
+4. **检测器可用**：本地规则有效；使用模型检测时远端服务也可访问。
+5. **实际命中**：请求进入已覆盖的文本提取路径并满足检测条件。
+
+相关实现入口：
+
+- `frontend/features/admin/views/security-policies.tsx`：访问安全/内容安全标签、策略编辑器和测试面板。
+- `frontend/features/admin/resources/settings-config.tsx`：访问安全通用资源字段。
+- `backend/internal/guardrails/policy.go`：Guardrail 数据模型、动作、范围和配置校验。
+- `backend/internal/guardrails/engine.go`：检测器执行、动作优先级、脱敏和模型降级。
+- `backend/internal/server/admin_guardrails_http.go`：内容安全策略管理与测试 API。
+- `backend/internal/server/guardrail_runtime.go`：网关请求判定、错误响应和审计摘要。
+
+### 11.4 后端 RBAC
 
 角色主要映射为：
 
@@ -966,19 +1071,173 @@ Callback 的协议、域名、端口、路径和尾部斜杠必须与身份平�
 
 需要特别注意：Admin RBAC 很多地方依赖 Handler 显式调用 `requireAdmin` 和对象级检查。新增 Handler 必须配套授权测试，不能只依赖前端隐藏菜单。
 
-### 11.4 密钥和敏感数据
+### 11.5 密钥和敏感数据
 
 - Project API Key 不保存明文，只保存 SHA-256 摘要。
 - Provider 凭证、原始账单快照、后台 Responses 载荷等使用从 `TOKENHUB_SECRET_KEY` 派生的 AES-GCM 密钥加密。
 - 所有共享数据库的实例必须使用同一个稳定 Secret Key。
 - 不要将真实 `.env`、数据库、备份、Provider Key 或 Token 提交到 Git。
 
-### 11.5 代理和 CORS
+### 11.6 代理和 CORS
 
 - `TOKENHUB_TRUSTED_PROXY_CIDRS` 决定哪些代理的 Forwarded Header 可被信任。
 - `TOKENHUB_CORS_ALLOWED_ORIGINS` 必须精确列出浏览器 Origin。
 - 生产环境不要为了方便使用通配 CORS。
 - 反向代理必须正确传递 Host、Proto 和 Client IP。
+
+### 11.7 健康与告警
+
+管理控制台的“健康与告警”分为五个相互关联但并不完全自动串联的部分：
+
+```text
+健康检测 → 告警事件 → 手工选择发送 → 通知渠道 → 通知记录
+     └──── 告警规则目前主要用于保存和展示规则元数据 ────┘
+```
+
+理解这一部分时，必须区分“健康状态记录”“真实上游探测”“告警事件”和“通知投递”。页面上存在配置或状态记录，并不代表系统已经执行真实模型调用、自动评估所有规则或自动发送通知。
+
+#### 11.7.1 健康检测
+
+系统会为以下对象生成默认 Monitor：
+
+- Provider
+- Provider Resource，即账号、API Key 或订阅资源实例
+- 存在启用路由的对外模型
+
+默认检测记录由 TokenHub 管理，通常带有 `managed_by: tokenhub_auto`，默认检测间隔为 60 秒。页面支持查看最近状态、消息、延迟和检测时间，并可点击“立即检测”。
+
+当前 Monitor 的实际检查逻辑是结构和状态检查，而不是完整的网络连通性或推理冒烟测试：
+
+| 目标 | 当前判定方式 |
+| --- | --- |
+| Provider | Provider 是否存在且状态为 `active` |
+| Provider Resource | Resource 是否存在且状态为 `active` |
+| Model | 是否至少存在一条状态为 `active` 的 ModelRoute |
+
+因此，“健康检测通过”只说明配置对象满足上述基础条件，不证明以下事项：
+
+- Provider Base URL 可以从 TokenHub 实例访问。
+- 凭证仍然有效。
+- 上游模型确实存在。
+- 路由关联的 Provider 和 Resource 都健康可用。
+- 一次真实推理请求能够成功。
+- 流式响应、工具调用、媒体或特定协议能力正常。
+
+Provider Resource 检测成功时，当前实现会把该资源标记为健康、清零失败次数并清除冷却时间。这个操作具有运行时影响，不应把“立即检测”理解为纯只读查看。如果需要确认真实上游连通性，应使用 Provider 页面提供的连接测试、资源探测、模型发现，或通过模型演练场执行代表性请求。
+
+默认 Monitor 的发现和到期执行目前发生在读取 Monitor 资源时：打开或刷新“健康检测”页面会补齐缺失的默认 Monitor，并运行新建或已到期的启用 Monitor。`interval_seconds` 是判断再次读取时是否到期的阈值，不是独立常驻 Scheduler 的严格执行周期。因此，长时间无人访问页面时，不能仅依赖该字段保证每 60 秒执行一次检测。
+
+检测失败会写入：
+
+- Monitor 的 `last_status`、`last_message`、`last_checked_at` 和 `latency_ms`。
+- 一条代码为 `monitor_check_failed` 的告警事件。
+
+#### 11.7.2 告警规则
+
+告警规则表单支持：
+
+- 指标：Provider 健康、Provider Resource 健康、请求额度、Token 额度、成本额度、错误率和 P95 延迟。
+- 阈值。
+- 级别：`info`、`warning`、`critical`。
+- 对象范围：Provider、Provider Resource、Quota、API Key、Project 或 Model。
+- 通知渠道。
+
+系统会补齐一组默认规则，包括：
+
+- Provider 不可用。
+- Provider Resource 不可用或进入冷却。
+- 请求额度达到或超过阈值。
+- Token 额度接近上限。
+- 成本额度接近上限。
+
+需要特别注意：当前 `alert-rules` 主要用于保存、展示和维护规则元数据。运行时告警事件由 Monitor、配额、成本和资源冷却等具体代码路径直接创建；这些事件生产路径尚未通过通用规则引擎统一读取规则中的 `metric`、`threshold`、`event_codes`、`severity` 和 `channel`。因此：
+
+- 新增一条自定义错误率或 P95 延迟规则，不代表后台已经开始周期计算该指标。
+- 修改默认规则阈值，不代表对应运行时事件触发条件一定随之改变。
+- 在规则中填写通知渠道，不代表事件会自动投递到该渠道。
+- 禁用规则也不应被当作关闭所有同类运行时事件的可靠开关。
+
+在通用告警评估器接入前，应把告警规则视为控制面配置和未来自动化契约，而不是已经完整执行的策略引擎。
+
+#### 11.7.3 告警事件
+
+告警事件是运行时已经发生的事实记录，常见来源包括：
+
+- Monitor 检测失败。
+- Provider Resource 进入冷却或恢复。
+- 请求、Token 或成本额度达到告警条件。
+- 配额拒绝和其他治理事件。
+
+事件通常记录：
+
+- 时间和严重级别。
+- 事件代码。
+- 对象类型和对象 ID。
+- 人类可读说明。
+- 相关 Resource ID。
+
+“告警事件”页面上的“发送”操作会将指定事件交给通知投递逻辑。当前没有通用后台流程自动将每条新事件发送出去，所以事件已经生成和外部通知已经送达是两个不同状态。
+
+#### 11.7.4 通知渠道
+
+当前支持的通知渠道包括：
+
+- 通用 Webhook
+- Slack
+- Discord
+- Telegram Bot
+- WhatsApp Cloud API
+- 飞书机器人
+- 钉钉机器人
+- 企业微信机器人
+- SMTP Email
+
+Webhook、机器人 Token、Access Token 和 SMTP 密码等敏感字段通过敏感管理资源存储逻辑保护；API 响应和通知记录不能返回可复用的明文凭证。编辑渠道时密码或 Token 留空表示保留原值。
+
+渠道的“发送测试通知”使用已经保存的配置，不使用表单中尚未保存的修改。测试不会创建正式告警事件，也不会改变渠道启用状态；即使渠道处于禁用状态，也可以显式执行测试。
+
+SMTP 加密模式：
+
+- `auto`：按服务器能力机会式升级 STARTTLS，属于兼容模式。
+- `starttls`：强制 STARTTLS，服务器不支持时发送失败，通常使用 587 端口。
+- `ssl`：从连接第一个字节开始使用隐式 TLS，通常使用 465 端口。
+
+生产环境应优先使用强制 TLS 模式，并验证证书链。Webhook URL、Bot Token、SMTP 密码和聊天目标都属于敏感配置，不应写入文档、日志、截图或 Git。
+
+#### 11.7.5 通知投递和通知记录
+
+手工发送告警时可以指定 Channel ID；没有指定时，后端选择数据库列表中的第一个启用渠道作为回退。这个“第一个”不应被当作稳定的业务优先级，因此生产操作最好显式指定渠道，或确保只有一个预期的默认启用渠道。
+
+每次投递都会创建通知记录，包括：
+
+- 告警 ID。
+- 渠道 ID 和渠道类型。
+- 脱敏后的目标摘要。
+- `success` 或 `failed` 状态。
+- 失败原因。
+- 用于审计的通知载荷快照。
+
+HTTP 2xx 不一定代表机器人平台接受了消息。飞书、钉钉和企业微信还会解析响应体中的业务错误码；业务错误码非零时记录为失败。通知记录和导出接口会执行凭证脱敏，不能依赖通知历史恢复原始 Secret。
+
+#### 11.7.6 推荐的生产验证顺序
+
+1. 配置一个通知渠道并保存。
+2. 执行“发送测试通知”，在实际收件箱或群机器人中确认收到。
+3. 查看“通知记录”，确认状态、目标和失败原因符合预期。
+4. 打开健康检测，理解默认 Monitor 只是结构状态检查。
+5. 使用 Provider 连接测试或模型演练场执行真实上游验证。
+6. 人工制造一条无破坏性的测试告警事件。
+7. 从告警事件页面显式发送，并确认外部渠道和通知记录一致。
+8. 在建立额外自动化前，不假设告警规则会自动计算或自动发送。
+
+相关实现入口：
+
+- `frontend/features/admin/resources/settings-config.tsx`：Monitor 和通知渠道配置。
+- `frontend/features/admin/resources/governance-config.tsx`：告警规则、事件和通知记录页面。
+- `backend/internal/server/admin_operations_http.go`：默认 Monitor、到期检查和默认告警规则。
+- `backend/internal/server/store_admin.go`：Monitor 的实际状态判定和失败事件创建。
+- `backend/internal/server/admin_notifications_http.go`：告警投递、渠道解析和通知协议。
+- `backend/internal/server/admin_notification_channels_http.go`：通知渠道测试。
 
 ## 12. 后台任务
 
@@ -1027,9 +1286,243 @@ PostgreSQL 使用行锁和 `SKIP LOCKED` 支持多实例领取；SQLite 用于�
 
 ## 13. Billing、Metering、Quota 与 Reconciliation
 
-这些概念容易混淆：
+这些概念容易混淆。控制台“成本治理”模块包含“成本账单”“额度策略”和“成本中心”，但其背后实际涉及实时计量、客户侧估算价格、Provider 侧成本、外部账单同步、预算准入和对账等不同数据链。
 
-### 13.1 实时计量
+### 13.1 控制台成本治理模块
+
+#### 13.1.1 成本口径
+
+TokenHub 中至少存在三类金额，页面显示“成本”时必须先确认具体口径：
+
+| 口径 | 来源 | 用途 |
+| --- | --- | --- |
+| 客户侧估算费用 | 对外 Model 的价格配置和请求 Usage | 项目、用户、Key、团队和成本中心归因，配额与管理报表 |
+| Provider 本地估算成本 | 上游 Provider Model 价格和请求 Usage | 上游成本预估、线路比较和预计毛利 |
+| Provider 外部账单金额 | Billing Connector 同步的供应商账单 | 财务核对和 Reconciliation |
+
+这三类金额不能直接混为一个数：
+
+- 估算费用不等于已经开票或收款。
+- 本地 Provider 成本不等于供应商最终账单。
+- 供应商账单可能包含折扣、退款、税费、最低消费、跨期费用或无法映射到单次请求的项目。
+- 预计毛利只是客户侧估算费用减去可识别的上游成本，不代表会计利润、现金流或已确认收入。
+
+#### 13.1.2 成本账单
+
+“成本账单”页面根据角色展示不同能力。
+
+平台管理员可以使用：
+
+- 精确计价与影子核对。
+- 下游、上游和预计毛利对账单。
+- 外部账单连接器。
+- 外部账单记录和同步运行历史。
+- 成本对账规则和对账结果。
+- Provider、Provider Resource 和成本中心成本汇总。
+
+团队负责人主要查看自己权限范围内的：
+
+- 成本中心归因。
+- 团队成员成本。
+- Provider 与资源账号的可见成本汇总。
+
+普通用户不能进入“成本账单”页面，只能在自己的用量页面查看权限范围内的估算费用。
+
+##### 精确计价与影子价目
+
+影子价目支持两种用途：
+
+- `tenant`：对外 Model 的租户费用核对。
+- `provider`：Provider 上游模型的成本核对。
+
+可分别配置：
+
+- 普通输入 Token。
+- 缓存读取 Token。
+- 通用缓存写入 Token。
+- 5 分钟缓存写入 Token。
+- 1 小时缓存写入 Token。
+- 输出 Token。
+- 币种和汇率。
+- 生效时间。
+- 按星期、时区和时间段覆盖的分时价格。
+- 价格依据或来源说明。
+
+单价单位是“原币/百万 Token”。`0` 表示免费，分时时段中的空价格表示继承基础价格。
+
+当前该页面发布的是**影子价目**：用于预览、核对和给新请求保存计价证据，不会直接替换现有收费、配额或预算口径。发布前应先执行费用预览；发布后可以通过 Request ID 查询请求保存的计费证据。不能使用今天的价格静默重算历史请求，因为历史请求必须保留当时的价格版本和时间段证据。
+
+##### 费用对账单
+
+费用对账单支持：
+
+- 下游费用对账单：按客户和一个或多个项目汇总租户费用。
+- 上游费用对账单：按 Provider、资源账号和上游模型查看本地估算及供应商账单。
+- 预计毛利汇总：比较可识别的租户费用和上游成本。
+
+账期使用开始日期、结束日期（不包含）和 IANA 时区。预览与 CSV 导出使用同一份结果。页面会区分：
+
+- 已记录租户费用。
+- Provider 本地估算成本。
+- Provider 供应商账单金额。
+- 未知金额。
+- 历史计价依据不足。
+- 跨期间但未分摊的供应商金额。
+
+该对账单只用于费用核对，不代表发票、付款、收款或财务确认。未知金额不能当作零，也不能直接使用当前价格补算历史缺失金额。
+
+##### 外部账单连接器
+
+当前支持：
+
+| 类型 | 数据来源 |
+| --- | --- |
+| OneAPI | OneAPI 兼容日志接口 |
+| NewAPI | NewAPI 额度与日志数据 |
+| Aliyun | 阿里云 `QueryInstanceBill` |
+
+连接器需要关联 TokenHub Provider ID；如果账单只对应一个账号，还应填写 Provider Resource ID。这个范围会在后续对账时限制 TokenHub 用量来源，避免其他 Provider 或资源账号混入。
+
+连接器支持：
+
+- 测试连接。
+- 立即同步。
+- 按分钟定时同步。
+- 启用或停用。
+- 分页、重试和请求限速。
+- Checkpoint 和增量恢复。
+- 幂等插入或更新账单记录。
+- 查看同步触发方式、状态、尝试次数和完成时间。
+
+停用连接器不会删除已有账单记录和同步历史。API Token、AccessKey Secret 等凭据会按敏感配置保存，编辑时留空表示保留原凭据；不能把凭据写入 URL 查询参数、文档、日志或 Git。
+
+外部同步不会替代网关实时计量。即使连接器停用或同步失败，TokenHub 仍可记录请求 Usage 和本地估算成本；只是暂时缺少供应商账单证据，无法完成完整对账。
+
+##### 成本对账规则
+
+对账规则将某个 Billing Connector 的外部记录与 TokenHub Usage 对齐。可配置：
+
+- 粒度：明细、小时、天或月。
+- 匹配维度：Request ID、Provider、资源账号、模型、项目和币种。
+- IANA 时区。
+- ISO 币种。
+- 固定金额容差和差异比例容差。
+- 明细时间窗口。
+- 供应商账单延迟窗口。
+- 定时执行间隔。
+- `1 USD = 目标币种` 的固定汇率。
+- Provider、资源账号、模型和项目维度映射。
+
+币种始终是匹配边界，不同币种应分别建立规则。USD 规则的汇率必须为 `1`。NewAPI 没有稳定的请求级标识，因此不支持明细粒度，只能使用小时、天或月。
+
+一次对账会产生四类结果：
+
+- 已匹配。
+- 仅 Provider 账单存在。
+- 仅 TokenHub Usage 存在。
+- 金额不一致。
+
+对账运行会保存规则版本和输入指纹。未锁定的成功结果可以重新计算；锁定后用于保留当时结论，不能再原地重算。差异明细可以分页查看并导出 CSV。
+
+#### 13.1.3 额度策略
+
+额度策略已经接入网关准入和结算链，是实际执行的运行时限制，不是仅供展示的配置。支持以下作用域：
+
+- `global`：全局。
+- `project`：指定项目。
+- `team`：指定团队。
+- `api_key`：指定 API Key。
+- `user`：指定用户拥有的全部 Key 聚合用量。
+
+支持的限制：
+
+| 字段 | 含义 |
+| --- | --- |
+| `rate_limit_rpm` | 每分钟请求数 |
+| `token_limit_tpm` | 每分钟 Token 数 |
+| `daily_requests` | 每日请求数 |
+| `monthly_requests` | 每月请求数 |
+| `daily_tokens` | 每日 Token 数 |
+| `monthly_tokens` | 每月 Token 数 |
+| `daily_cost_usd` | 每日客户侧估算费用 |
+| `monthly_cost_usd` | 每月客户侧估算费用 |
+| `max_concurrency` | 最大并发请求数 |
+
+同一个请求可能同时命中全局、团队、项目、Key 和用户策略。对于同类正数限制，系统执行最严格的最小值；`0` 或留空表示该策略不增加该项限制，不能覆盖或绕过上层更严格的正数限制。
+
+用户作用域按 API Key 的归属用户聚合该用户所有 Key 的用量：
+
+- 轮换 Key 不会重置用户额度。
+- 多个 Key 并行使用仍共享同一个用户桶。
+- 用户策略不会再被重复当作单 Key 限制计算。
+- 团队负责人只能管理其团队范围内的用户策略；平台管理员可以管理任意启用用户。
+
+额度执行流程包括：
+
+1. 请求鉴权并解析 Project、API Key 和归属用户。
+2. 合并适用额度策略和 Key 自身限制。
+3. Admission 时预留分钟桶、日/月桶和并发 Lease。
+4. Provider 返回后按实际 Usage 和成本结算。
+5. 失败、取消、缓存命中和后台任务按照各自路径退款或结算预留。
+
+每日和每月边界使用系统设置中的 `quota_timezone`，默认 UTC。修改时区会立即影响新请求和当前用量视图，但不会重新归属历史计数；切换时可能出现较短或较长的过渡周期。RPM、TPM 和高并发协调可使用 Redis，但数据库仍是最终持久账本。当前部署的 `TOKENHUB_BILLING_REDIS_URL` 为空，因此使用数据库准入路径。
+
+额度策略列表显示当前日/月请求、Token 和成本用量。这里的成本限制使用 TokenHub 的客户侧估算费用，不等同于外部 Provider 账单金额。
+
+#### 13.1.4 成本中心
+
+成本中心用于组织内部费用归属，主要字段包括：
+
+- 编码。
+- 名称。
+- 部门。
+- 负责人。
+- 月预算 USD。
+- 启用状态。
+
+项目可以直接指定成本中心，也可以从团队或项目默认额度配置回退解析。当前解析顺序大致为：
+
+1. Project 自身的 `cost_center`。
+2. Project 所属 Team 的 `cost_center`。
+3. Project 默认 Quota Policy 中的 `cost_center`。
+4. Team ID。
+5. `project:<project-id>`。
+6. `unknown`。
+
+请求计量时会把当时的 Project、Team、用户和成本中心归属固化到 Usage 记录或计量快照中。因此，之后修改项目或团队归属不应静默改写历史费用。
+
+需要注意：“成本中心”表单中的 `monthly_budget_usd` 当前主要用于治理配置、展示和导出，不等同于已经执行的网关预算上限。真正可以阻断请求的运行时预算使用独立的 `budgets` 资源及其 enforcement 配置。仅填写成本中心月预算，不能假定请求会在达到该金额时自动停止。
+
+成本中心本身也不会自动创建项目关系。要获得正确归因，需要在 Project 或 Team 中明确选择对应成本中心，并通过“用量”或“成本账单”页面检查实际归因结果。
+
+#### 13.1.5 推荐配置顺序
+
+1. 创建成本中心，配置稳定且唯一的编码、负责人和部门。
+2. 将 Team 和 Project 关联到正确的成本中心。
+3. 为全局、团队、项目、Key 或用户创建额度策略。
+4. 设置 `quota_timezone`，并在低流量时段验证日/月边界。
+5. 通过真实请求检查 Usage、成本中心归因和额度当前用量。
+6. 如需供应商账单核对，创建外部账单连接器并先测试连接。
+7. 执行一次限定时间范围的手工同步，确认币种、Provider 和资源账号映射。
+8. 创建对账规则，先使用较小账期验证匹配维度和容差。
+9. 处理未知金额、仅 Provider、仅 TokenHub 和金额差异后再锁定结果。
+10. 不要把估算费用、供应商账单和已确认财务金额混为一谈。
+
+相关实现入口：
+
+- `frontend/features/admin/views/usage-billing.tsx`：成本账单主页、成本汇总和外部连接器。
+- `frontend/features/admin/views/billing-rate-cards.tsx`：影子价目和计费证据。
+- `frontend/features/admin/views/billing-statements.tsx`：费用对账单。
+- `frontend/features/admin/views/billing-reconciliation.tsx`：对账规则、运行、锁定和导出。
+- `frontend/features/admin/resources/settings-config.tsx`：额度策略。
+- `frontend/features/admin/resources/governance-config.tsx`：成本中心。
+- `backend/internal/server/store_call_admission.go`：请求准入、预留和并发控制。
+- `backend/internal/server/store_backup_quota.go`：额度合并、预算和成本中心解析。
+- `backend/internal/server/metering_capture.go`：请求计量归因快照。
+- `backend/internal/server/billing_lifecycle.go`：外部账单定时同步。
+- `backend/internal/reconciliation/service.go` 与 `backend/internal/server/reconciliation_bridge.go`：内部 Usage 与外部账单对账。
+
+### 13.2 实时计量
 
 发生在模型请求链中：
 
@@ -1039,7 +1532,7 @@ PostgreSQL 使用行锁和 `SKIP LOCKED` 支持多实例领取；SQLite 用于�
 4. Settlement 将预留调整为实际值。
 5. 写入 Usage、Request Log 和归因字段。
 
-### 13.2 外部账单同步
+### 13.3 外部账单同步
 
 Billing Connector 定期从 Provider 或其他账单系统拉取 Statement：
 
@@ -1047,7 +1540,7 @@ Billing Connector 定期从 Provider 或其他账单系统拉取 Statement：
 - 将外部记录标准化并持久化。
 - 不直接替代实时计量。
 
-### 13.3 对账
+### 13.4 对账
 
 Reconciliation 将内部 Usage 与外部 Billing Record 对齐，用于发现：
 
@@ -1055,7 +1548,7 @@ Reconciliation 将内部 Usage 与外部 Billing Record 对齐，用于发现：
 - Project/Team/Cost Center 归属差异。
 - 汇率、价格或时间窗口问题。
 
-### 13.4 Agent Token Cost Analytics
+### 13.5 Agent Token Cost Analytics
 
 TokenHub 还提供独立的只读分析接口：`GET /api/v1/analytics/token-costs`。它面向本地报表、监控 Agent 或定时任务，不要求管理员 Session、模型调用 API Key 或 Provider 凭证。
 
@@ -1070,7 +1563,7 @@ TokenHub 还提供独立的只读分析接口：`GET /api/v1/analytics/token-cos
 
 分析结果中的 `estimated_cost_usd` 是管理用量页面使用的客户计费估算，不是 Provider 保密成本。完整契约见 `docs/agent-token-cost-api.md`。
 
-### 13.5 Redis 的位置
+### 13.6 Redis 的位置
 
 Redis 仅作为高并发分钟配额和并发 lease 的协调路径。数据库仍是最终持久账本。
 
