@@ -356,6 +356,259 @@ flowchart LR
 6. 对象级授权测试。
 7. 前端类型、payload mapper 和数据加载计划（如果 UI 使用）。
 
+### 6.4 AI 资源控制台模块
+
+控制台“AI 资源”包含五个入口：
+
+- Provider 渠道
+- 模型目录
+- 路由策略
+- 模型演练场
+- 作用域策略
+
+它们分别回答五个不同问题：
+
+```text
+Provider 渠道：上游服务和账号资源在哪里？
+模型目录：向调用方公开什么统一模型？
+路由策略：统一模型实际映射到哪些上游模型？
+模型演练场：按当前配置发起真实请求是否成功？
+作用域策略：某个 Key 或项目允许使用哪些候选线路？
+```
+
+最容易出现的配置错误，是把“Provider 已创建”“上游模型已引入”“对外模型已发布”“路由已启用”和“请求实际可用”误认为同一个状态。它们是相互关联但独立的层次。
+
+#### 6.4.1 Provider 渠道
+
+Provider 是一个上游渠道实例，通常包含：
+
+- Provider 类型和目录模板。
+- Base URL。
+- Provider 级凭据。
+- 优先级。
+- 启用状态和健康标记。
+- 协议及推理参数选项。
+- Provider Model 库存。
+- 一个或多个 Provider Resource。
+
+Provider Catalog 只是创建模板和候选元数据，不是已经可以调用的运行时实例。选择某个 Catalog 条目后，仍需保存实际 Provider、配置凭据、引入上游模型并建立路由。
+
+Provider 的 `status` 和 `healthy` 含义不同：
+
+- `status=active`：管理员允许该 Provider 参与运行。
+- `status=disabled`：管理员显式停用，不应进入候选集合。
+- `healthy=true`：当前运行状态允许使用。
+- `healthy=false`：运行时认为该 Provider 不健康，即使仍处于启用状态也会被过滤。
+
+手工勾选健康状态不等于真实连接已经验证。Provider 列表中的“测试”会优先调用适配器或内置插件声明的真实 Probe；没有专用 Probe 时回退到通用 Provider 测试。具体测试深度取决于 Provider 类型，可能只是鉴权或模型目录检查，不一定执行一次完整推理。
+
+##### Provider Resource
+
+Provider Resource 表示 Provider 下的实际账号、API Key、订阅、区域资源或资源池成员。它可以覆盖 Provider 级配置，并参与：
+
+- 账号或 API Key 选择。
+- Base URL 覆盖。
+- 分组、地域和环境边界。
+- 优先级与权重。
+- RPM、TPM 和最大并发。
+- 健康、失败计数和冷却。
+- 会话亲和。
+- 自定义请求头和协议扩展。
+- OAuth Token 刷新、额度读取及插件动作。
+
+普通 API Key 型 Resource 保存上游 API Key；账号订阅型 Resource 可以保存 Access Token、Refresh Token、ID Token、账号 ID、组织 ID和套餐信息。敏感凭据使用 `TOKENHUB_SECRET_KEY` 派生的密钥加密，保存后不会再次向前端返回明文。编辑时凭据留空表示保留原值。
+
+Provider 插件可以声明凭据必须位于 Resource，而不是 Provider 本身，也可以要求每次路由都必须选中一个健康 Resource。创建新 Provider 类型时，不能假设 Provider 级 API Key 对所有适配器都有效。
+
+账号资源的“续租 Token”“读取额度”“重置额度”“能力检测”等操作只有在对应进程内插件动作已经注册时才可执行。外部命令型 Provider 插件当前不会被生产运行时启动，因此不能仅根据 Manifest 声明判断这些动作可用。
+
+##### Provider Model 库存
+
+Provider Model 是从目录、模型发现或手工导入得到的上游模型库存，记录：
+
+- Provider ID。
+- 上游真实模型名。
+- 模态和能力。
+- 上下文窗口。
+- Provider 成本价格。
+- 协议与能力元数据。
+
+“已引入 Provider Model”只表示它可以被选择创建路由，不表示已经作为统一模型对客户端发布。Provider 成本也与模型目录中的对外价格分开维护。
+
+#### 6.4.2 模型目录
+
+模型目录中的 Model 是 TokenHub 对客户端公开的统一模型合同。业务应用在请求中填写的是这里的 `name`，而不是 Provider 的真实模型名。
+
+Model 主要配置：
+
+- 不可在编辑时改变的对外模型 ID。
+- 显示名称、系列和模型类型。
+- Chat、Embedding、Image、Video、Audio、OCR、Rerank 或 Decision 等模态。
+- Text、Image、Video、Audio 和 PDF 等输入模态。
+- 上下文窗口。
+- 能力标签和支持参数。
+- 对外输入、输出、缓存读写、Embedding 和检索价格。
+- 分时价格。
+- 启用状态。
+
+创建 Model 时必须选择至少一个已经引入的 Provider Model，系统会同步创建初始路由。后续可以在“路由策略”中调整优先级、权重和项目边界。
+
+需要区分：
+
+- **目录已存在**：数据库中存在统一 Model。
+- **已发布**：Model 状态为 `active`。
+- **有线路**：至少存在一条启用 ModelRoute。
+- **当前可调用**：至少一条线路经过 Provider、Resource、权限、协议和作用域过滤后仍可用。
+
+`GET /v1/models` 主要反映模型发布状态、启用路由和调用方模型权限。Provider 或 Resource 的短时健康变化通常不会立即把模型从目录响应中删除，因此“模型能被列出”不证明当前请求一定成功。
+
+模型目录中的价格是客户侧统一价格，用于用量估算、额度和成本归因；Provider Model 中的价格是上游成本。两者不应互相覆盖。修改价格也不应重算已经保存了历史计价证据的请求。
+
+`capabilities` 和 `supported_parameters` 是运行合同的一部分。模型演练场会根据支持参数决定显示哪些控件，网关和适配器也可能根据能力过滤请求。不能仅通过前端隐藏参数来代替后端协议校验。
+
+#### 6.4.3 路由策略
+
+ModelRoute 将统一 Model 映射到：
+
+```text
+对外 Model
+    → Provider
+    → 可选 Provider Resource
+    → Provider Model
+```
+
+一条路由可以配置：
+
+- Provider 和上游模型。
+- 优先级。
+- 流量权重。
+- 全部项目、仅指定项目或排除指定项目。
+- 路由标签。
+- 粘性会话。
+- 路由算法。
+- 启用状态。
+
+优先级数字越小越优先。权重用于同一优先级或相应算法下的流量分配；它不是成功率，也不是百分比上限。项目作用域会在作用域路由策略之前过滤线路：
+
+- `all`：所有项目都可以考虑该线路。
+- `include`：只有列出的项目可以使用。
+- `exclude`：列出的项目不能使用。
+
+常见路由策略包括：
+
+- `priority_only`：严格按优先级尝试。
+- `priority_weighted`：优先级与权重结合。
+- `balanced`：平衡候选流量。
+- `adaptive`：参考运行时表现自适应排序。
+- `cost`：倾向成本较低的线路。
+- `quality`：倾向质量评分较高的线路。
+- `inherit`：继承已有或作用域策略决定。
+
+具体候选仍必须先通过状态、健康、协议、模型权限、项目范围和作用域策略过滤。把某条路由权重设置得很高，不能让被禁用、不健康或不兼容的 Provider 强制参与请求。
+
+非流式请求可以在上游失败时尝试下一条候选线路；流式请求一旦已经向客户端提交内容，通常不能安全切换。Provider Resource 的熔断、冷却和半开恢复也会改变某条线路的实时可用性。
+
+粘性会话用于需要保持账号或上游上下文连续性的请求。开启粘性不代表永远固定到同一个故障资源；绑定仍受资源状态、冷却、授权和协议可用性约束。
+
+#### 6.4.4 作用域路由策略
+
+作用域策略在基础模型访问允许列表之后进一步收窄候选路由，可以限制：
+
+- 允许的 Provider。
+- 允许的 Provider Resource。
+- 允许的统一 Model。
+- 必需的路由标签。
+- 允许的地域。
+- 允许的环境。
+- 当前作用域使用的路由算法。
+
+支持以下绑定层级：
+
+```text
+API Key > Project > Global
+```
+
+这表示系统只选择最具体的一条有效绑定，而不是把三个层级的字段逐项合并：
+
+1. Key 有绑定时使用 Key 策略。
+2. 否则使用 Project 策略。
+3. 否则使用 Global 策略。
+4. 都没有时不应用额外作用域策略。
+
+同一个作用域对象只能绑定一条策略。存在多个绑定会返回冲突错误。`unbound` 策略只是尚未绑定的可复用定义，不参与请求。
+
+需要注意：如果最具体的已绑定策略处于禁用状态，系统会返回 `routing_policy_unavailable`，不会静默回退到较宽松的 Project 或 Global 策略。如果有效策略过滤后没有候选线路，请求返回 `routing_policy_no_candidate`。这种失败关闭行为用于避免安全边界因配置异常被绕过。
+
+地域和环境约束读取 Provider Resource 的 `region` 与 `environment`。如果策略要求地域或环境，而候选没有相应元数据，该候选也不会通过。必需标签要求路由同时具备全部指定标签。
+
+修改策略前应使用路由解释或模拟接口检查每条候选的允许/拒绝原因，避免一次错误绑定让整个 Project 或 Key 无路由可用。
+
+#### 6.4.5 模型演练场
+
+模型演练场通过与业务网关相同的 Provider Adapter、路由、Guardrail 和主要请求链执行真实模型请求，适合验证：
+
+- 对外模型是否有可用线路。
+- Provider 凭据和网络是否正常。
+- 流式或非流式行为。
+- 模型参数和能力声明。
+- 内容安全策略。
+- Token、成本和延迟诊断。
+- 路由命中与 Request ID。
+
+每个 Assistant 轮次保留独立候选和诊断摘要，包括：
+
+- 返回模式。
+- 首 Token 时间和总耗时。
+- 输出吞吐。
+- 输入、输出和缓存 Token。
+- 估算成本。
+- Request ID。
+- 按权限可见的 Provider、Resource 和路由尝试。
+
+上游不支持流式时，演练场会退化为缓冲模式，并把首 Token 时间标记为不适用，而不是伪造流式指标。停止请求会保留已经生成的部分文本。重跑某个轮次会创建新候选并删除后续分支，避免新分支静默复用旧上下文。
+
+演练场会话默认只存在于当前浏览器页面，除非用户显式导出，不是服务端持久会话。它适合功能验证，但不能替代持续监控、负载测试或独立 Provider 账单验证。
+
+演练场请求仍受当前用户权限、项目上下文、模型访问、额度、内容安全和路由策略影响。演练场成功只能证明本次请求在当时配置和健康状态下成功，不保证之后所有请求都成功。
+
+#### 6.4.6 推荐配置顺序
+
+1. 从 Provider Catalog 选择模板或创建自定义 Provider。
+2. 配置 Base URL、凭据和必要的 Provider Resource。
+3. 执行 Provider 或 Resource 的真实连接测试。
+4. 发现或手工引入 Provider Model。
+5. 在模型目录创建统一 Model，并选择初始 Provider Model。
+6. 检查自动生成的初始路由。
+7. 配置优先级、权重、项目范围、标签和粘性会话。
+8. 如有部署边界要求，再配置 Global、Project 或 API Key 作用域策略。
+9. 为 Project 和 API Key 授予统一 Model 访问权限。
+10. 使用模型演练场验证请求、流式、Usage、成本、Guardrail 和实际路由。
+11. 最后使用真实 Project API Key 从业务 SDK 完成端到端测试。
+
+排查“模型不可用”时建议按以下顺序检查：
+
+1. 统一 Model 是否启用。
+2. API Key 和 Project 是否允许该 Model。
+3. 是否存在启用路由。
+4. 路由项目范围是否包含当前 Project。
+5. 作用域策略是否允许 Model、Provider、Resource、标签、地域和环境。
+6. Provider 和 Resource 是否启用且健康。
+7. Provider Model 和请求协议是否匹配。
+8. Resource 是否处于冷却、并发耗尽或额度受限状态。
+9. Provider 网络、凭据和上游服务是否正常。
+10. 请求日志和 RouteAttemptLog 中记录了什么失败原因。
+
+相关实现入口：
+
+- `frontend/features/admin/resources/provider-model-config.tsx`：Provider、Resource、Model 和 Route CRUD 配置。
+- `frontend/features/admin/views/provider-editor.tsx`：Provider 创建、编辑、账号接入和高级配置。
+- `frontend/features/admin/resources/routing-policy-config.tsx`：作用域路由策略。
+- `frontend/features/admin/views/playground.tsx`：模型演练场。
+- `backend/internal/server/adapter_registry.go`：Provider Adapter 能力注册。
+- `backend/internal/server/admin_providers_http.go`：Provider、模型发现、测试和账号管理。
+- `backend/internal/server/scoped_routing_policy.go`：作用域策略选择和候选过滤。
+- `backend/internal/server/store_routing_calls.go`：路由尝试、结算和请求记录。
+
 ## 7. 一次模型请求如何执行
 
 下面以 `/v1/chat/completions` 为例。
